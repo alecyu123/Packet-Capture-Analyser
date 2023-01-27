@@ -6,6 +6,7 @@ from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP
 import time
 from enum import Enum
+import pickle
 
 class PktDirection(Enum):
     not_defined = 0
@@ -18,8 +19,8 @@ def printable_timestamp(ts, resol):
     ts_sec_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_sec))
     return '{}.{}'.format(ts_sec_str, ts_subsec)
 
-def process_pcap(file_name):
-    print('Opening {}...'.format(file_name))
+def pickle_pcap(pcap_file_in, pickle_file_out):
+    print('Processing {}...'.format(pcap_file_in))
 
     client = '192.168.1.137:57080'
     server = '152.19.134.43:80'
@@ -33,7 +34,15 @@ def process_pcap(file_name):
     server_sequence_offset = None
     client_sequence_offset = None
 
-    for (pkt_data, pkt_metadata,) in RawPcapReader(file_name):
+    # List of interesting packets, will finally be pickled.
+    # Each element of the list is a dictionary that contains fields of interest
+    # from the packet.
+    packets_for_analysis = []
+
+    client_recv_window_scale = 0
+    server_recv_window_scale = 0
+
+    for (pkt_data, pkt_metadata,) in RawPcapReader(pcap_file_in):
         count += 1
 
         ether_pkt = Ether(pkt_data)
@@ -111,31 +120,43 @@ def process_pcap(file_name):
         # logic, so first check that this is an unfragmented packet
         if (ip_pkt.flags == 'MF') or (ip_pkt.frag != 0):
             print('No support for fragmented IP packets')
-            break
+            return False
         
         tcp_payload_len = ip_pkt.len - (ip_pkt.ihl * 4) - (tcp_pkt.dataofs * 4)
 
-        # Print
-        fmt = '[{ordnl:>5}]{ts:>10.6f}s flag={flag:<3s} seq={seq:<9d} \
-        ack={ack:<9d} len={len:<6d}'
-        if direction == PktDirection.client_to_server:
-            fmt = '{arrow}' + fmt
-            arr = '-->'
-        else:
-            fmt = '{arrow:>69}' + fmt
-            arr = '<--'
+        # Look for the 'Window Scale' TCP option if this is a SYN or SYN-ACK
+        # packet.
+        if 'S' in str(tcp_pkt.flags):
+            for (opt_name, opt_value,) in tcp_pkt.options:
+                if opt_name == 'WScale':
+                    if direction == PktDirection.client_to_server:
+                        client_recv_window_scale = opt_value
+                    else:
+                        server_recv_window_scale = opt_value
+                    break
 
-        print(fmt.format(arrow = arr,
-                         ordnl = last_pkt_ordinal,
-                         ts = this_pkt_relative_timestamp / pkt_metadata.tsresol,
-                         flag = str(tcp_pkt.flags),
-                         seq = relative_offset_seq,
-                         ack = relative_offset_ack,
-                         len = tcp_payload_len))
+        # Create a dictionary and populate it with data that we'll need in the
+        # analysis phase.
+        
+        pkt_data = {}
+        pkt_data['direction'] = direction
+        pkt_data['ordinal'] = last_pkt_ordinal
+        pkt_data['relative_timestamp'] = this_pkt_relative_timestamp / \
+                                         pkt_metadata.tsresol
+        pkt_data['tcp_flags'] = str(tcp_pkt.flags)
+        pkt_data['seqno'] = relative_offset_seq
+        pkt_data['ackno'] = relative_offset_ack
+        pkt_data['tcp_payload_len'] = tcp_payload_len
+        if direction == PktDirection.client_to_server:
+            pkt_data['window'] = tcp_pkt.window << client_recv_window_scale
+        else:
+            pkt_data['window'] = tcp_pkt.window << server_recv_window_scale
+
+        packets_for_analysis.append(pkt_data)
     #---
 
     print('{} contains {} packets ({} interesting)'.
-          format(file_name, count, interesting_packet_count))
+          format(pcap_file_in, count, interesting_packet_count))
     
     print('First packet in connection: Packet #{} {}'.
           format(first_pkt_ordinal,
@@ -146,17 +167,64 @@ def process_pcap(file_name):
                  printable_timestamp(last_pkt_timestamp,
                                      last_pkt_timestamp_resolution)))
 
+    print('Writing pickle file {}...'.format(pickle_file_out), end='')
+    with open(pickle_file_out, 'wb') as pickle_fd:
+        pickle.dump(client, pickle_fd)
+        pickle.dump(server, pickle_fd)
+        pickle.dump(packets_for_analysis, pickle_fd)
+    print('done.')
+
+def analyze_pickle(pickle_file_in):
+
+    packets_for_analysis = []
+    
+    with open(pickle_file_in, 'rb') as pickle_fd:
+        client_ip_addr_port = pickle.load(pickle_fd)
+        server_ip_addr_port = pickle.load(pickle_fd)
+        packets_for_analysis = pickle.load(pickle_fd)
+
+    # Print a header
+    print('##################################################################')
+    print('TCP session between client {} and server {}'.
+          format(client_ip_addr_port, server_ip_addr_port))
+    print('##################################################################')
+        
+    # Print format string
+    fmt = ('[{ordnl:>5}]{ts:>10.6f}s {flag:<3s} seq={seq:<8d} '
+           'ack={ack:<8d} len={len:<6d} win={win:<9d}')
+
+    for pkt_data in packets_for_analysis:
+
+        direction = pkt_data['direction']
+
+        if direction == PktDirection.client_to_server:
+            print('{}'.format('-->'), end='')
+        else:
+            print('{:>60}'.format('<--'), end='')
+
+        print(fmt.format(ordnl = pkt_data['ordinal'],
+                         ts = pkt_data['relative_timestamp'],
+                         flag = pkt_data['tcp_flags'],
+                         seq = pkt_data['seqno'],
+                         ack = pkt_data['ackno'],
+                         len = pkt_data['tcp_payload_len'],
+                         win = pkt_data['window']))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PCAP reader')
     parser.add_argument('--pcap', metavar='<pcap file name>',
                         help='pcap file to parse', required=True)
+    parser.add_argument('--pickle', metavar='<pickle file name>',
+                        help='pickle file to write', required=True)
     args = parser.parse_args()
+    print(args)
 
-    file_name = args.pcap
-    if not os.path.isfile(file_name):
-        print('"{}" does not exist'.format(file_name), file=sys.stderr)
+    file_in = args.pcap
+    file_out = args.pickle
+
+    if not os.path.isfile(file_in):
+        print('"{}" does not exist'.format(file_in), file=sys.stderr)
         sys.exit(-1)
 
-    process_pcap(file_name)
+    pickle_pcap(file_in, file_out)
     sys.exit(0)
